@@ -1895,7 +1895,7 @@ MT5.ServerTime <- function()
 #' Undefined direction transaction appears as \code{N/A} in MT5's Times & Sales table. Those transactions are automatically removed by default (\code{bIgnoreNAs = TRUE}). See References.
 #'
 #' @param sSymbol character; target symbol.
-#' @param iRows int; how many rows. It's start from last. (default: \code{10})
+#' @param iRows int; how many rows. It's start from last. Use \code{Inf} to request all available ticks (will auto-increase the request size until MT5 returns fewer rows). (default: \code{10})
 #' @param bIgnoreNAs bool; ignore \code{NA} type in Times & Series of MT5 table. See references. (default: \code{TRUE})
 #'
 #' @return
@@ -1920,67 +1920,89 @@ MT5.GetTimesSales <- function(sSymbol, iRows = 10, bIgnoreNAs = TRUE)
     sSymbol <- sSymbol[1]
   }
   sSymbol <- as.character(sSymbol)
-  iRows <- as.integer(iRows)
-  iRows <- ifelse(iRows < 1, 1, iRows)
-  stopifnot(!is.na(iRows))
-
-  sRequest <- MT5.Connect(base::paste0("P6 ", paste(
-    sSymbol, iRows,
-    sep = "?")))
-
-  if(sRequest[[1]] == "P6ERROR")
+  get_once <- function(iRows)
   {
-    warning(base::paste0(sSymbol, ": error! Check Expert tab in MT5 to more details!"))
-    return(data.frame())
-  }else if(sRequest[[1]] == "P6ERROR2")
-  {
-    warning(base::paste0(sSymbol, ": symbol was not found? \nCheck if symbol is in MT5's marketwatch. Check ?MT5.Marketwatch, ?MT5.SymbolInMarketwatch, ?MT5.MarketwatchAdd"))
-    return(data.frame())
-  }else if(sRequest[[1]] == "P6ERROR3")
-  {
-    warning(base::paste0(sSymbol, ": there is no Times & Sales table"))
-    return(data.frame())
-  }
+    iRows <- as.integer(iRows)
+    iRows <- ifelse(iRows < 1, 1, iRows)
+    stopifnot(!is.na(iRows))
 
-  sStringTable <- utils::read.table(text = sRequest, sep = "?", stringsAsFactors = F)
-  sStringTable <- lapply(sStringTable, function(x){utils::read.table(text = x, sep = " ", stringsAsFactors = F)})
+    sRequest <- MT5.Connect(base::paste0("P6 ", paste(
+      sSymbol, iRows,
+      sep = "?")))
 
-  ## Removing NA rows
-  NA_Rows <- as.logical(unlist(lapply(sStringTable, length)) > 5)
-
-  if(!bIgnoreNAs)
-  {
-    sStringTable[which(NA_Rows)] <- lapply(sStringTable[which(NA_Rows)], function(x){x[-c(4,5)]})
-
-    for(i in 1:length(sStringTable))
+    if(sRequest[[1]] == "P6ERROR")
     {
-      colnames(sStringTable[i][[1]]) <- 1:5
+      warning(base::paste0(sSymbol, ": error! Check Expert tab in MT5 to more details!"))
+      return(data.frame())
+    }else if(sRequest[[1]] == "P6ERROR2")
+    {
+      warning(base::paste0(sSymbol, ": symbol was not found? \nCheck if symbol is in MT5's marketwatch. Check ?MT5.Marketwatch, ?MT5.SymbolInMarketwatch, ?MT5.MarketwatchAdd"))
+      return(data.frame())
+    }else if(sRequest[[1]] == "P6ERROR3")
+    {
+      warning(base::paste0(sSymbol, ": there is no Times & Sales table"))
+      return(data.frame())
     }
 
-    Unprocessed_Table <- do.call(rbind, sStringTable)
-    Unprocessed_Table[which(NA_Rows),3] <- NA
-  }else
-  {
-    if(any(NA_Rows == TRUE))
+    sStringTable <- utils::read.table(text = sRequest, sep = "?", stringsAsFactors = F)
+    sStringTable <- lapply(sStringTable, function(x){utils::read.table(text = x, sep = " ", stringsAsFactors = F)})
+
+    ## Removing NA rows
+    NA_Rows <- as.logical(unlist(lapply(sStringTable, length)) > 5)
+
+    if(!bIgnoreNAs)
     {
-      warning("NA rows from MT5 are been detected and have been removed.")
+      sStringTable[which(NA_Rows)] <- lapply(sStringTable[which(NA_Rows)], function(x){x[-c(4,5)]})
+
+      for(i in 1:length(sStringTable))
+      {
+        colnames(sStringTable[i][[1]]) <- 1:5
+      }
+
+      Unprocessed_Table <- do.call(rbind, sStringTable)
+      Unprocessed_Table[which(NA_Rows),3] <- NA
+    }else
+    {
+      if(any(NA_Rows == TRUE))
+      {
+        warning("NA rows from MT5 are been detected and have been removed.")
+      }
+
+      Unprocessed_Table <- do.call(rbind, sStringTable[!NA_Rows])
     }
 
-    Unprocessed_Table <- do.call(rbind, sStringTable[!NA_Rows])
+    df <- data.frame(Datetime = as.POSIXct(paste(Unprocessed_Table[,1], Unprocessed_Table[,2]), format = "%Y.%m.%d %H:%M:%OS"),
+                     Type = Unprocessed_Table[,3],
+                     Price = Unprocessed_Table[,4],
+                     Volume = Unprocessed_Table[,5])
+
+    if(any(!complete.cases(df)))
+    {
+      warning("NA dates detected and have been removed.")
+      df <- df[complete.cases(df),]
+    }
+
+    return(df)
   }
 
-  df <- data.frame(Datetime = as.POSIXct(paste(Unprocessed_Table[,1], Unprocessed_Table[,2]), format = "%Y.%m.%d %H:%M.%OS"),
-                   Type = Unprocessed_Table[,3],
-                   Price = Unprocessed_Table[,4],
-                   Volume = Unprocessed_Table[,5])
-
-  if(any(complete.cases(df))==F)
+  if(is.infinite(iRows))
   {
-    warning("NA dates detected and have been removed.")
-    df <- df[complete.cases(df),]
+    iReq <- 2000L
+    df <- get_once(iReq)
+    repeat
+    {
+      if(base::nrow(df) < iReq) return(df)
+      if(iReq >= .Machine$integer.max %/% 2L)
+      {
+        warning("Reached the maximum request size while trying to fetch all ticks. Returning the last result.")
+        return(df)
+      }
+      iReq <- iReq * 2L
+      df <- get_once(iReq)
+    }
   }
 
-  return(df)
+  return(get_once(iRows))
 }
 
 #' Exemple function
