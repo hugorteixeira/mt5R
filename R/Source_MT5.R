@@ -305,6 +305,7 @@ MT5.Connect <- function(sReq, iPort = 23456, bMsg = FALSE, timeout = getOption("
     ## Experimental
     return("C3OK")
   }
+  if(base::length(server_resp) == 0) return(NULL)
   if(bError) return(NULL)
   if(bMsg) base::print(paste("MT5: '", server_resp,"'"))
 
@@ -2003,6 +2004,799 @@ MT5.GetTimesSales <- function(sSymbol, iRows = 10, bIgnoreNAs = TRUE)
   }
 
   return(get_once(iRows))
+}
+
+.MT5_TickTypeCode <- function(sType)
+{
+  sType <- tolower(as.character(sType)[1])
+  if(!sType %in% c("all", "info", "trade"))
+  {
+    stop("Error: sType should be 'all', 'info' or 'trade'!")
+  }
+
+  switch(sType,
+         all = 0L,
+         info = 1L,
+         trade = 2L)
+}
+
+.MT5_EmptyTicks <- function(with_symbol = FALSE)
+{
+  df <- data.frame(Datetime = as.POSIXct(character()),
+                   Bid = numeric(),
+                   Ask = numeric(),
+                   Last = numeric(),
+                   Volume = numeric(),
+                   Flags = integer(),
+                   VolumeReal = numeric(),
+                   TimeMsc = numeric(),
+                   stringsAsFactors = FALSE)
+
+  if(with_symbol)
+  {
+    df <- cbind(data.frame(sSymbol = character(), stringsAsFactors = FALSE), df)
+  }
+
+  return(df)
+}
+
+.MT5_TimeMscToDatetime <- function(time_msc)
+{
+  return(as.POSIXct(time_msc / 1000, origin = "1970-01-01", tz = "UTC"))
+}
+
+.MT5_TicksFullFilePath <- function(sSymbol, sType, sFile = NULL, sDir = NULL)
+{
+  .MT5_TickTypeCode(sType)
+
+  sSymbol <- as.character(sSymbol)[1]
+  sType <- tolower(as.character(sType)[1])
+
+  if(is.null(sFile))
+  {
+    sFile <- base::paste0(sSymbol, "_ticks_full.csv")
+  }
+
+  sFile <- as.character(sFile)[1]
+  if(is.na(sFile) || sFile == "") stop("Error: sFile should be a valid csv path!")
+
+  if(is.null(sDir))
+  {
+    dir_part <- dirname(sFile)
+    if(is.na(dir_part) || dir_part %in% c("", ".")) dir_part <- "."
+  }else
+  {
+    sDir <- as.character(sDir)[1]
+    if(is.na(sDir) || sDir == "") stop("Error: sDir should be a valid directory path!")
+    dir_part <- sDir
+  }
+
+  file_base <- basename(sFile)
+  ext <- tools::file_ext(file_base)
+  if(identical(ext, "")) ext <- "csv"
+
+  stem <- sub(paste0("\\.", ext, "$"), "", file_base, ignore.case = TRUE)
+  stem <- sub("_(all|info|trade)$", "", stem, ignore.case = TRUE)
+  file_base <- base::paste0(stem, "_", sType, ".", ext)
+
+  if(!dir.exists(dir_part))
+  {
+    dir.create(dir_part, recursive = TRUE, showWarnings = FALSE)
+  }
+
+  return(file.path(dir_part, file_base))
+}
+
+.MT5_TickKey <- function(df)
+{
+  if(is.null(df) || base::nrow(df) == 0) return(character())
+
+  return(base::paste(df$TimeMsc,
+                     df$Bid,
+                     df$Ask,
+                     df$Last,
+                     df$Volume,
+                     df$Flags,
+                     df$VolumeReal,
+                     sep = "|"))
+}
+
+.MT5_SkipBoundaryTicks <- function(df, boundary_msc, skip_n)
+{
+  if(is.null(df) || base::nrow(df) == 0) return(df)
+  skip_n <- as.integer(skip_n)[1]
+  if(is.na(skip_n) || skip_n <= 0) return(df)
+
+  idx_boundary <- which(df$TimeMsc == boundary_msc)
+  if(base::length(idx_boundary) == 0) return(df)
+
+  drop_n <- min(skip_n, base::length(idx_boundary))
+  df <- df[-idx_boundary[seq_len(drop_n)], , drop = FALSE]
+  row.names(df) <- NULL
+  return(df)
+}
+
+.MT5_NormalizeTicks <- function(df)
+{
+  if(is.null(df) || base::nrow(df) == 0) return(.MT5_EmptyTicks())
+
+  required_cols <- c("Datetime", "Bid", "Ask", "Last", "Volume", "Flags", "VolumeReal", "TimeMsc")
+  for(sCol in required_cols)
+  {
+    if(!sCol %in% names(df)) df[[sCol]] <- NA
+  }
+
+  time_msc <- suppressWarnings(as.numeric(df$TimeMsc))
+  dt <- suppressWarnings(as.POSIXct(df$Datetime, tz = "UTC"))
+  dt_from_msc <- .MT5_TimeMscToDatetime(time_msc)
+
+  idx_use_msc <- !is.na(time_msc) &
+    (is.na(dt) | abs(as.numeric(dt) - time_msc / 1000) > 0.001)
+  if(any(idx_use_msc))
+  {
+    dt[idx_use_msc] <- dt_from_msc[idx_use_msc]
+  }
+
+  idx_missing_msc <- is.na(time_msc) & !is.na(dt)
+  if(any(idx_missing_msc))
+  {
+    time_msc[idx_missing_msc] <- round(as.numeric(dt[idx_missing_msc]) * 1000)
+  }
+
+  df_norm <- data.frame(Datetime = dt,
+                        Bid = suppressWarnings(as.numeric(df$Bid)),
+                        Ask = suppressWarnings(as.numeric(df$Ask)),
+                        Last = suppressWarnings(as.numeric(df$Last)),
+                        Volume = suppressWarnings(as.numeric(df$Volume)),
+                        Flags = suppressWarnings(as.integer(df$Flags)),
+                        VolumeReal = suppressWarnings(as.numeric(df$VolumeReal)),
+                        TimeMsc = time_msc,
+                        stringsAsFactors = FALSE)
+
+  df_norm <- df_norm[!is.na(df_norm$TimeMsc), , drop = FALSE]
+  if(base::nrow(df_norm) == 0) return(.MT5_EmptyTicks())
+
+  ord <- order(df_norm$TimeMsc, seq_len(base::nrow(df_norm)))
+  df_norm <- df_norm[ord, , drop = FALSE]
+
+  row.names(df_norm) <- NULL
+  return(df_norm)
+}
+
+.MT5_TicksToFileFrame <- function(df)
+{
+  if(is.null(df) || base::nrow(df) == 0)
+  {
+    return(data.frame(Datetime = character(),
+                      Bid = numeric(),
+                      Ask = numeric(),
+                      Last = numeric(),
+                      Volume = numeric(),
+                      Flags = integer(),
+                      VolumeReal = numeric(),
+                      TimeMsc = character(),
+                      stringsAsFactors = FALSE))
+  }
+
+  return(data.frame(Datetime = format(df$Datetime, "%Y-%m-%d %H:%M:%OS3", tz = "UTC"),
+                    Bid = format(df$Bid, scientific = FALSE, trim = TRUE, digits = 16),
+                    Ask = format(df$Ask, scientific = FALSE, trim = TRUE, digits = 16),
+                    Last = format(df$Last, scientific = FALSE, trim = TRUE, digits = 16),
+                    Volume = format(df$Volume, scientific = FALSE, trim = TRUE, digits = 16),
+                    Flags = as.integer(df$Flags),
+                    VolumeReal = format(df$VolumeReal, scientific = FALSE, trim = TRUE, digits = 16),
+                    TimeMsc = sprintf("%.0f", df$TimeMsc),
+                    stringsAsFactors = FALSE))
+}
+
+.MT5_ReadTicksFile <- function(sFile)
+{
+  if(is.null(sFile) || !file.exists(sFile) || file.info(sFile)$size <= 0)
+  {
+    return(list(df = .MT5_EmptyTicks(), needs_rewrite = FALSE))
+  }
+
+  raw_df <- tryCatch(utils::read.csv(sFile,
+                                     stringsAsFactors = FALSE,
+                                     fill = TRUE),
+                     error = function(e) NULL)
+  if(is.null(raw_df) || base::nrow(raw_df) == 0)
+  {
+    return(list(df = .MT5_EmptyTicks(), needs_rewrite = file.info(sFile)$size > 0))
+  }
+
+  df <- .MT5_NormalizeTicks(raw_df)
+  required_cols <- c("Datetime", "Bid", "Ask", "Last", "Volume", "Flags", "VolumeReal", "TimeMsc")
+  needs_rewrite <- (!all(required_cols %in% names(raw_df))) || (base::nrow(raw_df) != base::nrow(df))
+
+  if(!needs_rewrite && all(c("Datetime", "TimeMsc") %in% names(raw_df)))
+  {
+    raw_time_msc <- suppressWarnings(as.numeric(raw_df$TimeMsc))
+    raw_dt <- suppressWarnings(as.POSIXct(raw_df$Datetime, tz = "UTC"))
+    idx_bad_dt <- !is.na(raw_time_msc) &
+      (is.na(raw_dt) | abs(as.numeric(raw_dt) - raw_time_msc / 1000) > 0.001)
+    needs_rewrite <- any(idx_bad_dt)
+  }
+
+  return(list(df = df, needs_rewrite = needs_rewrite))
+}
+
+.MT5_WriteTicksFile <- function(df, sFile, append = FALSE)
+{
+  if(is.null(sFile)) return(invisible(NULL))
+
+  df_file <- .MT5_TicksToFileFrame(df)
+  bAppend <- isTRUE(append) && file.exists(sFile) && file.info(sFile)$size > 0
+
+  utils::write.table(df_file,
+                     file = sFile,
+                     sep = ",",
+                     row.names = FALSE,
+                     col.names = !bAppend,
+                     append = bAppend,
+                     quote = TRUE,
+                     qmethod = "double")
+
+  invisible(NULL)
+}
+
+.MT5_ParseRawTicks <- function(sRequest)
+{
+  sStringTable <- utils::read.table(text = sRequest, sep = "?", stringsAsFactors = FALSE)
+  sStringTable <- lapply(sStringTable, function(x){utils::read.table(text = x, sep = " ", stringsAsFactors = FALSE)})
+  Unprocessed_Table <- do.call(rbind, sStringTable)
+
+  if(base::ncol(Unprocessed_Table) < 8)
+  {
+    stop("Error: unexpected tick payload returned by MT5.")
+  }
+
+  dt_text <- as.POSIXct(paste(Unprocessed_Table[,1], Unprocessed_Table[,2]),
+                        format = "%Y.%m.%d %H:%M:%OS",
+                        tz = "UTC")
+  if(base::ncol(Unprocessed_Table) >= 9)
+  {
+    time_msc <- as.numeric(Unprocessed_Table[,9])
+    dt <- .MT5_TimeMscToDatetime(time_msc)
+
+    idx_missing_msc <- is.na(time_msc)
+    if(any(idx_missing_msc))
+    {
+      dt[idx_missing_msc] <- dt_text[idx_missing_msc]
+      time_msc[idx_missing_msc] <- round(as.numeric(dt_text[idx_missing_msc]) * 1000)
+    }
+  }else
+  {
+    dt <- dt_text
+    time_msc <- round(as.numeric(dt_text) * 1000)
+  }
+
+  df <- data.frame(Datetime = dt,
+                   Bid = as.numeric(Unprocessed_Table[,3]),
+                   Ask = as.numeric(Unprocessed_Table[,4]),
+                   Last = as.numeric(Unprocessed_Table[,5]),
+                   Volume = as.numeric(Unprocessed_Table[,6]),
+                   Flags = as.integer(Unprocessed_Table[,7]),
+                   VolumeReal = as.numeric(Unprocessed_Table[,8]),
+                   TimeMsc = time_msc,
+                   stringsAsFactors = FALSE)
+
+  if(any(!complete.cases(df$Datetime)))
+  {
+    warning("NA dates detected and have been removed.")
+    df <- df[complete.cases(df$Datetime),]
+  }
+
+  row.names(df) <- NULL
+  return(df)
+}
+
+.MT5_RequestRawTicks <- function(sCommand, sSymbol, iRows, sType = "all", from_msc = NULL)
+{
+  sSymbol <- as.character(sSymbol)[1]
+  iTickType <- .MT5_TickTypeCode(sType)
+  iRows <- as.integer(iRows)
+  iRows <- ifelse(iRows < 1, 1, iRows)
+  stopifnot(!is.na(iRows))
+  iTimeout <- max(as.numeric(getOption("timeout")), 60)
+
+  sPrefix <- substr(sCommand, 1, 2)
+  if(is.null(from_msc))
+  {
+    sReq <- base::paste0(sCommand, " ", paste(sSymbol, iRows, iTickType, sep = "?"))
+  }else
+  {
+    from_msc <- as.numeric(from_msc)[1]
+    if(is.na(from_msc) || from_msc < 0) stop("Error: from_msc should be a non-negative number!")
+    sReq <- base::paste0(sCommand, " ", paste(sSymbol, sprintf("%.0f", from_msc), iRows, iTickType, sep = "?"))
+  }
+
+  sRequest <- MT5.Connect(sReq, timeout = iTimeout)
+
+  if(is.null(sRequest) || base::length(sRequest) == 0)
+  {
+    warning(base::paste0(sSymbol, ": error! Empty response from MT5."))
+    return(.MT5_EmptyTicks())
+  }else if(sRequest[[1]] == base::paste0(sPrefix, "ERROR"))
+  {
+    warning(base::paste0(sSymbol, ": error! Check Expert tab in MT5 to more details!"))
+    return(.MT5_EmptyTicks())
+  }else if(sRequest[[1]] == base::paste0(sPrefix, "ERROR2"))
+  {
+    warning(base::paste0(sSymbol, ": symbol was not found? \nCheck if symbol is in MT5's marketwatch. Check ?MT5.Marketwatch, ?MT5.SymbolInMarketwatch, ?MT5.MarketwatchAdd"))
+    return(.MT5_EmptyTicks())
+  }else if(sRequest[[1]] == base::paste0(sPrefix, "ERROR3"))
+  {
+    return(.MT5_EmptyTicks())
+  }else if(sRequest[[1]] == base::paste0(sPrefix, "ERROR4"))
+  {
+    stop("Error: tick type not supported")
+  }
+
+  return(.MT5_ParseRawTicks(sRequest))
+}
+
+.MT5_SupportsTicksSince <- function(sSymbol, sType = "all")
+{
+  seed <- suppressWarnings(MT5.GetTicks(sSymbol, iRows = 1, sType = sType))
+  if(base::nrow(seed) == 0) return(NA)
+
+  probe <- suppressWarnings(.MT5_RequestRawTicks("P8",
+                                                 sSymbol = sSymbol,
+                                                 iRows = 1,
+                                                 sType = sType,
+                                                 from_msc = 1))
+
+  return(base::nrow(probe) > 0)
+}
+
+#' Load raw tick data
+#'
+#' @description
+#' Function to load raw MT5 ticks of target symbol.
+#'
+#' Unlike [mt5R::MT5.GetTimesSales()], this function can return quote ticks (Bid/Ask updates), trade ticks, or all ticks available in MT5.
+#'
+#' For many brokers, \code{sType = "info"} is the best choice to reproduce real-time quote movement. \code{sType = "trade"} can be empty on symbols where the broker does not expose trade ticks.
+#'
+#' @param sSymbol character; target symbol.
+#' @param iRows int; how many rows. It's start from last. Use \code{Inf} to request all available ticks (will auto-increase the request size until MT5 returns fewer rows). (default: \code{10})
+#' @param sType character; which tick stream should be requested. Supported values are \code{"all"}, \code{"info"} and \code{"trade"}. (default: \code{"all"})
+#'
+#' @return
+#' Returns \emph{Data.frame} \eqn{[nx8]}, with follow informations:
+#' \itemize{
+#'   \item Datetime \code{{POSIXct}}: Datetime of tick.
+#'   \item Bid \code{{numeric}}: Bid price in the tick.
+#'   \item Ask \code{{numeric}}: Ask price in the tick.
+#'   \item Last \code{{numeric}}: Last traded price in the tick.
+#'   \item Volume \code{{numeric}}: Tick volume.
+#'   \item Flags \code{{int}}: MT5 tick flags.
+#'   \item VolumeReal \code{{numeric}}: Real volume reported by MT5.
+#'   \item TimeMsc \code{{numeric}}: Tick timestamp in milliseconds since Unix epoch.
+#'   }
+#'
+#' @references
+#' \url{https://www.mql5.com/en/docs/constants/structures/mqltick}
+#'
+#' @author Guilherme Kinzel, \email{guikinzel@@gmail.com}
+#' @export
+MT5.GetTicks <- function(sSymbol, iRows = 10, sType = "all")
+{
+  if(base::length(sSymbol) > 1)
+  {
+    warning("MT5.GetTicks only works with one symbol at a time!")
+    sSymbol <- sSymbol[1]
+  }
+  sSymbol <- as.character(sSymbol)[1]
+
+  get_once <- function(iRows)
+  {
+    .MT5_RequestRawTicks("P7", sSymbol = sSymbol, iRows = iRows, sType = sType)
+  }
+
+  if(is.infinite(iRows))
+  {
+    iReq <- 2000L
+    df <- get_once(iReq)
+    repeat
+    {
+      if(base::nrow(df) < iReq) return(df)
+      if(iReq >= .Machine$integer.max %/% 2L)
+      {
+        warning("Reached the maximum request size while trying to fetch all ticks. Returning the last result.")
+        return(df)
+      }
+      iReq <- iReq * 2L
+      df <- get_once(iReq)
+    }
+  }
+
+  return(get_once(iRows))
+}
+
+#' Load raw tick data since a given timestamp
+#'
+#' @description
+#' Function to load raw MT5 ticks of target symbol starting from a given timestamp in milliseconds since Unix epoch.
+#'
+#' This is a low-level incremental helper used by [mt5R::MT5.DownloadTicksFull()] and [mt5R::MT5.StreamTicksLive()] when the MT5 Expert Advisor supports the \code{P8} command.
+#'
+#' @param sSymbol character; target symbol.
+#' @param from_msc numeric; timestamp in milliseconds since Unix epoch.
+#' @param iRows int; maximum number of ticks to request. (default: \code{2000})
+#' @param sType character; which tick stream should be requested. Supported values are \code{"all"}, \code{"info"} and \code{"trade"}. (default: \code{"all"})
+#'
+#' @return
+#' Returns \emph{Data.frame} \eqn{[nx8]} with the same columns of [mt5R::MT5.GetTicks()].
+#'
+#' @references
+#' \url{https://www.mql5.com/en/docs/matrix/matrix_initialization/matrix_copyticks}
+#'
+#' @author Guilherme Kinzel, \email{guikinzel@@gmail.com}
+#' @export
+MT5.GetTicksSince <- function(sSymbol, from_msc, iRows = 2000, sType = "all")
+{
+  if(base::length(sSymbol) > 1)
+  {
+    warning("MT5.GetTicksSince only works with one symbol at a time!")
+    sSymbol <- sSymbol[1]
+  }
+
+  return(.MT5_RequestRawTicks("P8",
+                              sSymbol = sSymbol,
+                              iRows = iRows,
+                              sType = sType,
+                              from_msc = from_msc))
+}
+
+#' Download all available raw ticks
+#'
+#' @description
+#' Downloads all available raw ticks of a symbol from MT5 in chunks.
+#'
+#' When \code{sFile} is supplied, the function can be safely called again with the same path. It will load the local csv cache, repair duplicated or incomplete trailing rows and continue downloading only what is still missing from MT5.
+#'
+#' The final file name is normalized to end with \code{_<sType>.csv} (or the same extension supplied in \code{sFile}). Use \code{sDir} to choose the output directory without manually building the full path. When \code{sDir} is supplied and \code{sFile = NULL}, the default file name is \code{<symbol>_ticks_full_<sType>.csv}.
+#'
+#' The \code{Datetime} column written to disk is reconstructed from \code{TimeMsc}, so the local cache stays aligned with the millisecond timestamps returned by MT5. Repeated trade ticks sharing the same millisecond are preserved, which is important for volume-based and money-based bar construction.
+#'
+#' There is no intentional sleep inside the download loop. The execution time is mostly driven by the MT5 terminal response time, socket transfer size and csv I/O when \code{bWriteEachBatch = TRUE}. Use \code{bWriteEachBatch = FALSE} for lower disk overhead if you do not need checkpointing during the current run.
+#'
+#' @param sSymbol character; target symbol.
+#' @param sType character; which tick stream should be requested. Supported values are \code{"all"}, \code{"info"} and \code{"trade"}. (default: \code{"all"})
+#' @param iChunk int; chunk size used in each request. (default: \code{2000})
+#' @param sFile character or \code{NULL}; optional file path to save the result as \code{csv}. (default: \code{NULL})
+#' @param sDir character or \code{NULL}; optional directory used together with \code{sFile}. When supplied, the file is read/written inside this directory. (default: \code{NULL})
+#' @param bShowProgress bool; print progress while downloading. (default: \code{TRUE})
+#' @param bResume bool; if \code{TRUE} and \code{sFile} already exists, load the local file, repair duplicated/incomplete trailing rows and continue downloading only what is missing. (default: \code{TRUE})
+#' @param bWriteEachBatch bool; if \code{TRUE} and \code{sFile} is not \code{NULL}, append each new batch to disk immediately so interrupted runs can be resumed safely. (default: \code{TRUE})
+#'
+#' @return
+#' Returns \emph{Data.frame} \eqn{[nx8]} with the same columns of [mt5R::MT5.GetTicks()].
+#'
+#' @author Guilherme Kinzel, \email{guikinzel@@gmail.com}
+#' @export
+MT5.DownloadTicksFull <- function(sSymbol, sType = "all", iChunk = 2000, sFile = NULL, sDir = NULL, bShowProgress = TRUE, bResume = TRUE, bWriteEachBatch = TRUE)
+{
+  if(base::length(sSymbol) > 1)
+  {
+    warning("MT5.DownloadTicksFull only works with one symbol at a time!")
+    sSymbol <- sSymbol[1]
+  }
+  sSymbol <- as.character(sSymbol)[1]
+  iChunk <- as.integer(iChunk)
+  iChunk <- ifelse(iChunk < 1, 1, iChunk)
+  bResume <- isTRUE(bResume)
+  bWriteEachBatch <- isTRUE(bWriteEachBatch)
+  if(!is.null(sFile) || !is.null(sDir))
+  {
+    sFile <- .MT5_TicksFullFilePath(sSymbol = sSymbol,
+                                    sType = sType,
+                                    sFile = sFile,
+                                    sDir = sDir)
+  }
+
+  df_existing <- .MT5_EmptyTicks()
+  from_msc <- 1
+  boundary_n <- 0L
+  iTotal <- 0L
+
+  if(!is.null(sFile) && bResume && file.exists(sFile))
+  {
+    local_ticks <- .MT5_ReadTicksFile(sFile)
+    df_existing <- local_ticks$df
+
+    if(local_ticks$needs_rewrite)
+    {
+      .MT5_WriteTicksFile(df_existing, sFile, append = FALSE)
+    }
+
+    if(base::nrow(df_existing) > 0)
+    {
+      from_msc <- tail(df_existing$TimeMsc, 1)
+      boundary_n <- sum(df_existing$TimeMsc == from_msc)
+      iTotal <- base::nrow(df_existing)
+
+      if(isTRUE(bShowProgress))
+      {
+        message(base::paste0(sSymbol,
+                             ": resuming from local file with ",
+                             iTotal,
+                             " ticks. last=",
+                             format(tail(df_existing$Datetime, 1), "%Y-%m-%d %H:%M:%OS3", tz = "UTC")))
+      }
+    }
+  }
+
+  bSupportsSince <- .MT5_SupportsTicksSince(sSymbol, sType = sType)
+  if(identical(bSupportsSince, FALSE))
+  {
+    if(isTRUE(bShowProgress))
+    {
+      message(base::paste0(sSymbol, ": MT5 terminal appears to be running an older EA without P8 incremental ticks. Falling back to MT5.GetTicks(iRows = Inf)."))
+    }
+
+    df_fallback <- MT5.GetTicks(sSymbol, iRows = Inf, sType = sType)
+    if(base::nrow(df_existing) > 0)
+    {
+      df_fallback <- .MT5_NormalizeTicks(rbind(df_existing, df_fallback))
+    }
+    if(!is.null(sFile))
+    {
+      .MT5_WriteTicksFile(df_fallback, sFile, append = FALSE)
+    }
+    return(df_fallback)
+  }else if(is.na(bSupportsSince))
+  {
+    if(base::nrow(df_existing) > 0) return(df_existing)
+    return(.MT5_EmptyTicks())
+  }
+
+  lTicks <- list()
+  iBatch <- 0L
+
+  repeat
+  {
+    iReq <- if(from_msc > 1 && boundary_n > 0L) max(iChunk, boundary_n + iChunk) else iChunk
+    df <- MT5.GetTicksSince(sSymbol, from_msc = from_msc, iRows = iReq, sType = sType)
+    n_raw <- base::nrow(df)
+    if(n_raw == 0) break
+
+    if(boundary_n > 0L)
+    {
+      df <- .MT5_SkipBoundaryTicks(df, boundary_msc = from_msc, skip_n = boundary_n)
+    }
+
+    if(base::nrow(df) == 0) break
+
+    iBatch <- iBatch + 1L
+    iTotal <- iTotal + base::nrow(df)
+    if(is.null(sFile) || !bWriteEachBatch)
+    {
+      lTicks[[iBatch]] <- df
+    }
+
+    if(!is.null(sFile) && bWriteEachBatch)
+    {
+      .MT5_WriteTicksFile(df, sFile, append = TRUE)
+    }
+
+    last_msc <- tail(df$TimeMsc, 1)
+    n_last <- sum(df$TimeMsc == last_msc)
+    if(last_msc == from_msc)
+    {
+      boundary_n <- boundary_n + n_last
+    }else
+    {
+      boundary_n <- n_last
+    }
+    from_msc <- last_msc
+
+    if(isTRUE(bShowProgress))
+    {
+      message(base::paste0(sSymbol,
+                           ": batch ", iBatch,
+                           " ticks=", base::nrow(df),
+                           " total=", iTotal,
+                           " last=", format(tail(df$Datetime, 1), "%Y-%m-%d %H:%M:%OS3")))
+    }
+
+    if(n_raw < iReq) break
+  }
+
+  if(!is.null(sFile))
+  {
+    if(!bWriteEachBatch)
+    {
+      df_new <- if(base::length(lTicks) == 0) .MT5_EmptyTicks() else do.call(rbind, lTicks)
+      df_final <- if(base::nrow(df_existing) > 0) .MT5_NormalizeTicks(rbind(df_existing, df_new)) else .MT5_NormalizeTicks(df_new)
+      .MT5_WriteTicksFile(df_final, sFile, append = FALSE)
+      return(df_final)
+    }
+
+    return(.MT5_ReadTicksFile(sFile)$df)
+  }
+
+  if(base::length(lTicks) == 0)
+  {
+    if(base::nrow(df_existing) > 0) return(df_existing)
+    return(.MT5_EmptyTicks())
+  }
+
+  df_new <- do.call(rbind, lTicks)
+  if(base::nrow(df_existing) > 0)
+  {
+    return(.MT5_NormalizeTicks(rbind(df_existing, df_new)))
+  }
+
+  row.names(df_new) <- NULL
+  return(df_new)
+}
+
+#' Synchronize a local tick file with MT5
+#'
+#' @description
+#' If the local file already exists, repairs duplicated or incomplete trailing rows and downloads only ticks that are still missing.
+#' If the file does not exist, creates it from scratch.
+#'
+#' This is a convenience wrapper around [mt5R::MT5.DownloadTicksFull()] for the common workflow of keeping a local tick cache updated across multiple runs.
+#'
+#' The final cache file name is normalized in the same way as [mt5R::MT5.DownloadTicksFull()], so the resulting file ends with \code{_<sType>.csv}.
+#'
+#' @param sSymbol character; target symbol.
+#' @param sFile character; csv file used as the local tick cache.
+#' @param sDir character or \code{NULL}; optional directory used together with \code{sFile}. When supplied, the file is read/written inside this directory. (default: \code{NULL})
+#' @param sType character; which tick stream should be requested. Supported values are \code{"all"}, \code{"info"} and \code{"trade"}. (default: \code{"all"})
+#' @param iChunk int; chunk size used in each request. (default: \code{2000})
+#' @param bShowProgress bool; print progress while downloading. (default: \code{TRUE})
+#' @param bWriteEachBatch bool; if \code{TRUE}, append each new batch to disk immediately so interrupted runs can be resumed safely. (default: \code{TRUE})
+#'
+#' @return
+#' Returns \emph{Data.frame} \eqn{[nx8]} with the same columns of [mt5R::MT5.GetTicks()].
+#'
+#' @author Guilherme Kinzel, \email{guikinzel@@gmail.com}
+#' @export
+MT5.SyncTicksFull <- function(sSymbol, sFile, sType = "all", iChunk = 2000, sDir = NULL, bShowProgress = TRUE, bWriteEachBatch = TRUE)
+{
+  sFile <- as.character(sFile)[1]
+  if(is.na(sFile) || sFile == "") stop("Error: sFile should be a valid csv path!")
+
+  return(MT5.DownloadTicksFull(sSymbol = sSymbol,
+                               sType = sType,
+                               iChunk = iChunk,
+                               sFile = sFile,
+                               sDir = sDir,
+                               bShowProgress = bShowProgress,
+                               bResume = TRUE,
+                               bWriteEachBatch = bWriteEachBatch))
+}
+
+#' Stream live raw ticks without repeating the same tick
+#'
+#' @description
+#' Polls MT5 for new ticks of one or more symbols and only prints or forwards ticks which have not been seen yet.
+#'
+#' The function tracks \code{TimeMsc} and a tick fingerprint to avoid repeating the same row across polling cycles. This makes it suitable as a backend for live candlestick or quote charts that need every new tick only once.
+#'
+#' @param sSymbols character(); vector of target symbols.
+#' @param sType character; which tick stream should be requested. Supported values are \code{"all"}, \code{"info"} and \code{"trade"}. (default: \code{"all"})
+#' @param iRows int; maximum number of ticks requested per polling cycle and per symbol. (default: \code{2000})
+#' @param fSleep numeric; seconds between polling cycles. (default: \code{0.25})
+#' @param iSeconds numeric; total running time in seconds. Use \code{Inf} to keep running until interrupted. (default: \code{Inf})
+#' @param FUN function or \code{NULL}; optional callback called with each batch of new ticks. (default: \code{NULL})
+#' @param bPrint bool; print each new batch to the console. (default: \code{TRUE})
+#'
+#' @return
+#' Returns \emph{Data.frame} \eqn{[nx9]} with columns \code{sSymbol} plus the columns of [mt5R::MT5.GetTicks()].
+#'
+#' @author Guilherme Kinzel, \email{guikinzel@@gmail.com}
+#' @export
+MT5.StreamTicksLive <- function(sSymbols, sType = "all", iRows = 2000, fSleep = 0.25, iSeconds = Inf, FUN = NULL, bPrint = TRUE)
+{
+  stopifnot(is.character(sSymbols))
+  if(!is.null(FUN) && !is.function(FUN)) stop("Error: FUN should be a function or NULL!")
+
+  sSymbols <- as.character(sSymbols)
+  iRows <- as.integer(iRows)
+  iRows <- ifelse(iRows < 1, 1, iRows)
+  fSleep <- as.numeric(fSleep)[1]
+  if(is.na(fSleep) || fSleep < 0) stop("Error: fSleep should be zero or positive!")
+
+  state <- stats::setNames(vector("list", length(sSymbols)), sSymbols)
+  lTicks <- list()
+  iBatch <- 0L
+
+  for(sSymbol in sSymbols)
+  {
+    seed <- MT5.GetTicks(sSymbol, iRows = 1, sType = sType)
+    bSupportsSince <- .MT5_SupportsTicksSince(sSymbol, sType = sType)
+    if(base::nrow(seed) > 0)
+    {
+      last_msc <- tail(seed$TimeMsc, 1)
+      boundary_keys <- .MT5_TickKey(seed[seed$TimeMsc == last_msc, , drop = FALSE])
+      state[[sSymbol]] <- list(from_msc = last_msc,
+                               boundary_keys = boundary_keys,
+                               supports_since = !identical(bSupportsSince, FALSE),
+                               recent_keys = boundary_keys)
+    }else
+    {
+      state[[sSymbol]] <- list(from_msc = 1,
+                               boundary_keys = character(),
+                               supports_since = !identical(bSupportsSince, FALSE),
+                               recent_keys = character())
+    }
+  }
+
+  dtStart <- Sys.time()
+
+  repeat
+  {
+    if(!is.infinite(iSeconds))
+    {
+      if(as.numeric(difftime(Sys.time(), dtStart, units = "secs")) >= iSeconds) break
+    }
+
+    for(sSymbol in sSymbols)
+    {
+      if(isTRUE(state[[sSymbol]]$supports_since))
+      {
+        df <- MT5.GetTicksSince(sSymbol,
+                                from_msc = state[[sSymbol]]$from_msc,
+                                iRows = iRows,
+                                sType = sType)
+
+        if(base::nrow(df) > 0 && base::length(state[[sSymbol]]$boundary_keys) > 0)
+        {
+          df <- df[!.MT5_TickKey(df) %in% state[[sSymbol]]$boundary_keys, , drop = FALSE]
+        }
+      }else
+      {
+        df <- MT5.GetTicks(sSymbol,
+                           iRows = iRows,
+                           sType = sType)
+
+        if(base::nrow(df) > 0 && base::length(state[[sSymbol]]$recent_keys) > 0)
+        {
+          df <- df[!.MT5_TickKey(df) %in% state[[sSymbol]]$recent_keys, , drop = FALSE]
+        }
+      }
+
+      if(base::nrow(df) == 0) next
+
+      last_msc <- tail(df$TimeMsc, 1)
+      state[[sSymbol]]$from_msc <- last_msc
+      state[[sSymbol]]$boundary_keys <- .MT5_TickKey(df[df$TimeMsc == last_msc, , drop = FALSE])
+      state[[sSymbol]]$recent_keys <- tail(c(state[[sSymbol]]$recent_keys,
+                                             .MT5_TickKey(df)),
+                                           max(1000L, iRows * 20L))
+
+      df$sSymbol <- sSymbol
+      df <- df[,c("sSymbol", "Datetime", "Bid", "Ask", "Last", "Volume", "Flags", "VolumeReal", "TimeMsc")]
+      row.names(df) <- NULL
+
+      iBatch <- iBatch + 1L
+      lTicks[[iBatch]] <- df
+
+      if(isTRUE(bPrint))
+      {
+        base::print(df)
+      }
+
+      if(!is.null(FUN))
+      {
+        FUN(df)
+      }
+    }
+
+    Sys.sleep(fSleep)
+  }
+
+  if(base::length(lTicks) == 0) return(.MT5_EmptyTicks(with_symbol = TRUE))
+
+  df_final <- do.call(rbind, lTicks)
+  row.names(df_final) <- NULL
+  return(df_final)
 }
 
 #' Exemple function

@@ -1,0 +1,20 @@
+Patch for `socket-library-mt4-mt5.mqh` with newer MetaEditor builds.
+
+Apply this around lines 553-556 of the original file:
+
+```diff
+-               int ptr1, ptr2;
+-               RtlMoveMemory(ptr1, nres + 12, 4);
+-               RtlMoveMemory(ptr2, ptr1, 4);
++               uint ptr1 = 0, ptr2 = 0;
++               RtlMoveMemory(ptr1, nres + 12, 4);
++               RtlMoveMemory(ptr2, ptr1, 4);
+                RtlMoveMemory(addr, ptr2, 4);
+```
+
+Optional cleanup for the 64-bit branch:
+
+```diff
+-               ulong ptr1, ptr2, ptr3;
++               ulong ptr1 = 0, ptr2 = 0, ptr3 = 0;
+```

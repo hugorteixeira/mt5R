@@ -147,6 +147,59 @@ MT5.Ping()
 
 If it returns ``TRUE`` everything has been successfully installed and you're ready to use mt5R! Yay!
 
+### Raw tick data and live streaming
+
+mt5R also provides raw MT5 tick functions for quote-level history, local tick caches and live chart updates:
+
+* `MT5.GetTicks()`: loads the most recent raw ticks.
+* `MT5.DownloadTicksFull()`: downloads the full tick history available in MT5 in chunks.
+* `MT5.SyncTicksFull()`: resumes or updates a local `.csv` file, repairing duplicated or incomplete trailing rows before continuing.
+* `MT5.StreamTicksLive()`: polls MT5 and only forwards unseen ticks, which is useful for live candlestick and quote charts.
+
+For many brokers, `sType = "info"` is the best choice for real-time quote movement. Use `sType = "trade"` when you need executed trades for tape-style analysis, volume bars or money bars. `sType = "trade"` and `MT5.GetTimesSales()` can still be empty for symbols where the broker does not expose trade ticks.
+
+When a cache file is used, mt5R now normalizes the final file name so it ends with `_<sType>.csv`. You can also pass `sDir` to choose the output directory without manually building the full path. The cached `Datetime` column is reconstructed from `TimeMsc`, so it stays aligned with the MT5 millisecond timestamp, and repeated trade ticks sharing the same millisecond are preserved.
+
+```{r rawticks, eval = FALSE}
+symbol <- "EURUSD"
+MT5.MarketwatchAdd(symbol)
+
+recent_ticks <- MT5.GetTicks(symbol, iRows = 10, sType = "info")
+head(recent_ticks)
+
+ticks_full <- MT5.DownloadTicksFull(
+  sSymbol = symbol,
+  sType = "trade",
+  iChunk = 20000,
+  sFile = paste0(symbol, "_ticks_full.csv"),
+  sDir = "tick_cache",
+  bShowProgress = TRUE,
+  bResume = TRUE,
+  bWriteEachBatch = TRUE
+)
+# Writes to: tick_cache/EURUSD_ticks_full_trade.csv
+
+ticks_sync <- MT5.SyncTicksFull(
+  sSymbol = symbol,
+  sFile = paste0(symbol, "_ticks_full.csv"),
+  sDir = "tick_cache",
+  sType = "trade",
+  iChunk = 20000,
+  bShowProgress = TRUE
+)
+
+live_ticks <- MT5.StreamTicksLive(
+  sSymbols = c(symbol),
+  sType = "info",
+  iRows = 1000,
+  fSleep = 0.25,
+  iSeconds = 30,
+  bPrint = TRUE
+)
+```
+
+If `sFile` is supplied, calling `MT5.DownloadTicksFull()` again with the same base file name, or calling `MT5.SyncTicksFull()`, will continue from the normalized local cache instead of restarting from zero. Use `bWriteEachBatch = FALSE` only when you want less disk I/O and do not need resumable checkpoints during the current run.
+
 ### Creating your own functions
 
 The most awesome part of MT5 is make reliable to create your owns solutions and functions. The cookbook is still under construction, but you can start checking functions `MT5.zExample` in mt5R package and `Z1` order in `mt5R v0_1_5.mq5`. Its pretty easy!

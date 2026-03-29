@@ -9,7 +9,7 @@ MT5.GetTimesSales(sSymbol, iRows = 10, bIgnoreNAs = TRUE)
 \arguments{
 \item{sSymbol}{character; target symbol.}
 
-\item{iRows}{int; how many rows. It's start from last. (default: \code{10})}
+\item{iRows}{int; how many rows. It's start from last. Use \code{Inf} to request all available ticks (will auto-increase the request size until MT5 returns fewer rows). (default: \code{10})}
 
 \item{bIgnoreNAs}{bool; ignore \code{NA} type in Times & Series of MT5 table. See references. (default: \code{TRUE})}
 }
